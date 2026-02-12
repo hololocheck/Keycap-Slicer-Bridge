@@ -13,7 +13,12 @@ import threading
 import time
 import shutil
 from http.server import HTTPServer, BaseHTTPRequestHandler
-import cgi
+try:
+    import cgi
+except ImportError:
+    cgi = None
+import io
+import re
 
 # === Configuration ===
 PORT = 19876
@@ -32,6 +37,7 @@ ALLOWED_ORIGINS = [
     "http://localhost",
     "http://127.0.0.1",
     "https://sireai.github.io",
+    "https://hololocheck.github.io",
     "null",
 ]
 
@@ -639,15 +645,52 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 self._send_json(400, {"error": "Expected multipart/form-data"})
                 return
 
-            form = cgi.FieldStorage(
-                fp=self.rfile, headers=self.headers,
-                environ={'REQUEST_METHOD': 'POST', 'CONTENT_TYPE': content_type}
-            )
+            content_length = int(self.headers.get('Content-Length', 0))
+            body = self.rfile.read(content_length)
 
-            slicer_type = form.getvalue('slicer', 'bambu').lower()
-            if slicer_type not in ('bambu', 'orca'):
-                self._send_json(400, {"error": f"Unknown slicer: {slicer_type}"})
+            # Parse multipart boundary
+            boundary = None
+            for part in content_type.split(';'):
+                part = part.strip()
+                if part.startswith('boundary='):
+                    boundary = part[9:].strip('"')
+                    break
+            if not boundary:
+                self._send_json(400, {"error": "No boundary in multipart"})
                 return
+
+            # Parse multipart fields
+            slicer_type = 'bambu'
+            file_data = None
+            filename = 'model.3mf'
+            boundary_bytes = ('--' + boundary).encode()
+            parts = body.split(boundary_bytes)
+            for part in parts:
+                if b'Content-Disposition' not in part:
+                    continue
+                header_end = part.find(b'\r\n\r\n')
+                if header_end < 0:
+                    continue
+                header_section = part[:header_end].decode('utf-8', errors='replace')
+                part_body = part[header_end + 4:]
+                if part_body.endswith(b'\r\n'):
+                    part_body = part_body[:-2]
+
+                # Extract field name
+                name_match = re.search(r'name="([^"]*)"', header_section)
+                if not name_match:
+                    continue
+                field_name = name_match.group(1)
+
+                if field_name == 'slicer':
+                    slicer_type = part_body.decode('utf-8', errors='replace').strip().lower()
+                elif field_name == 'file':
+                    file_data = part_body
+                    fn_match = re.search(r'filename="([^"]*)"', header_section)
+                    if fn_match and fn_match.group(1):
+                        filename = os.path.basename(fn_match.group(1))
+
+            slicer_type = slicer_type if slicer_type in ('bambu', 'orca') else 'bambu'
 
             slicer_path = find_slicer(slicer_type)
             if not slicer_path:
@@ -656,23 +699,21 @@ class BridgeHandler(BaseHTTPRequestHandler):
                                        "message": f"{name}が見つかりません。"})
                 return
 
-            if 'file' not in form:
+            if file_data is None:
                 self._send_json(400, {"error": "No file provided"})
                 return
 
-            file_item = form['file']
-            filename = os.path.basename(file_item.filename or "model.3mf")
             _, ext = os.path.splitext(filename)
             if ext.lower() not in ALLOWED_EXTENSIONS:
                 self._send_json(400, {"error": f"File type not allowed: {ext}"})
                 return
 
-            os.makedirs(TEMP_DIR, exist_ok=True)
-            file_path = os.path.join(TEMP_DIR, filename)
-            file_data = file_item.file.read()
             if len(file_data) > 100 * 1024 * 1024:
                 self._send_json(400, {"error": "File too large (max 100MB)"})
                 return
+
+            os.makedirs(TEMP_DIR, exist_ok=True)
+            file_path = os.path.join(TEMP_DIR, filename)
 
             with open(file_path, 'wb') as f:
                 f.write(file_data)

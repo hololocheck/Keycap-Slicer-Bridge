@@ -6,7 +6,7 @@
 
 <p align="center">
   <strong>Keycap Generator → Bambu Studio / OrcaSlicer ダイレクト転送ブリッジ</strong><br>
-  <a href="https://keycapgenerator.com">Keycap Generator</a> でエクスポートした3Dモデルをワンクリックでスライサーに送信
+  <a href="https://github.com/hololocheck/Keycap_Generator">Keycap Generator</a> でエクスポートした3Dモデルをワンクリックでスライサーに送信
 </p>
 
 <p align="center">
@@ -20,7 +20,7 @@
 
 ## 概要
 
-Keycap Slicer Bridge は、[Keycap Generator](https://keycapgenerator.com) のエクスポートダイアログから Bambu Studio / OrcaSlicer にモデルファイルを直接転送するための軽量ブリッジアプリケーションです。
+Keycap Slicer Bridge は、[Keycap Generator](https://github.com/hololocheck/Keycap_Generator) のエクスポートダイアログから Bambu Studio / OrcaSlicer にモデルファイルを直接転送するための軽量ブリッジアプリケーションです。
 
 タスクトレイに常駐し、ローカル HTTP サーバー（`127.0.0.1:19876`）として動作します。
 

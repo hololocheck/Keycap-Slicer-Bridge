@@ -69,7 +69,7 @@ pyinstaller --onefile --windowed --name "KeycapSlicerBridge" --icon=icon.ico --c
 
 ### Keycap Generator での操作
 
-1. Keycap Slicer Bridge が起動中の状態で [Keycap Generator](https://keycapgenerator.com) を開く
+1. Keycap Slicer Bridge が起動中の状態で [Keycap Generator](https://github.com/hololocheck/Keycap_Generator) を開く
 2. エクスポートボタンを押すと、ダイアログのエクスポートボタンがスプリットボタンに変化
 3. ▲ をクリックしてドロップダウンから送信先を選択
    - **エクスポート** — 通常のファイルダウンロード

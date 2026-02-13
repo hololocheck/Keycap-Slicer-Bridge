@@ -19,11 +19,12 @@ except ImportError:
     cgi = None
 import io
 import re
+import zipfile
 
 # === Configuration ===
 PORT = 19876
 APP_NAME = "Keycap Slicer Bridge"
-VERSION = "2.1.0"
+VERSION = "2.6.2"
 APP_DIR_NAME = "KeycapSlicerBridge"
 INSTALL_DIR = os.path.join(os.environ.get('LOCALAPPDATA', os.path.expanduser('~')), APP_DIR_NAME)
 TEMP_DIR = os.path.join(tempfile.gettempdir(), "keycap-slicer-bridge")
@@ -54,7 +55,967 @@ SLICER_PATHS = {
     ]
 }
 
+
 ALLOWED_EXTENSIONS = {'.stl', '.3mf', '.obj', '.step', '.stp'}
+
+# =====================================================
+# Project Filament Scanner v2.5
+# VERIFIED data formats from user's actual .3mf:
+#   project_settings.config → JSON: {"filament_colour":["#B5","#21",...]}
+#   slice_info.config       → XML:  <filament id="1" color="#B5..." type="PLA"/>
+#   Config/filament/*.json  → JSON: {"filament_colour":["#FF"],...}
+# BambuStudio.conf          → JSON (25KB+, may have extra data after main object)
+# =====================================================
+
+import xml.etree.ElementTree as ET
+
+
+
+def _normalize_hex(v):
+    """Normalize hex color string to #RRGGBB uppercase."""
+    if v is None:
+        return ''
+    if isinstance(v, list):
+        v = v[0] if v else ''
+    v = str(v).strip().strip('"\'').strip()
+    if not v:
+        return ''
+    if re.match(r'^#[0-9a-fA-F]{6}$', v):
+        return v.upper()
+    if re.match(r'^#[0-9a-fA-F]{8}$', v):
+        return v[:7].upper()
+    if re.match(r'^#[0-9a-fA-F]{3}$', v):
+        return f'#{v[1]*2}{v[2]*2}{v[3]*2}'.upper()
+    if re.match(r'^[0-9a-fA-F]{6}$', v):
+        return f'#{v}'.upper()
+    return ''
+
+
+def _try_read_file(path, max_bytes=50*1024*1024):
+    """Read text file with encoding fallbacks. Default 50MB."""
+    for enc in ('utf-8-sig', 'utf-8', 'cp932', 'latin-1'):
+        try:
+            with open(path, 'r', encoding=enc) as f:
+                return f.read(max_bytes)
+        except (UnicodeDecodeError, UnicodeError):
+            continue
+        except (PermissionError, OSError):
+            return None
+    return None
+
+
+def _try_parse_json(text):
+    """Parse JSON tolerantly (trailing commas, comments, extra data after JSON)."""
+    if not text:
+        return None, 'empty'
+    text = text.lstrip('\ufeff')
+    try:
+        return json.loads(text), None
+    except json.JSONDecodeError as e:
+        err1 = str(e)
+
+    # Fallback 1: raw_decode — handles "Extra data" (valid JSON + trailing garbage)
+    try:
+        decoder = json.JSONDecoder()
+        obj, end_idx = decoder.raw_decode(text)
+        return obj, None
+    except json.JSONDecodeError:
+        pass
+
+    # Fallback 2: remove trailing commas
+    cleaned = re.sub(r',\s*([}\]])', r'\1', text)
+    try:
+        return json.loads(cleaned), None
+    except json.JSONDecodeError:
+        pass
+
+    # Fallback 3: raw_decode on cleaned
+    try:
+        obj, _ = json.JSONDecoder().raw_decode(cleaned)
+        return obj, None
+    except json.JSONDecodeError:
+        pass
+
+    # Fallback 4: remove // comments
+    lines = [l for l in cleaned.splitlines() if not l.lstrip().startswith('//')]
+    cleaned2 = '\n'.join(lines)
+    try:
+        return json.loads(cleaned2), None
+    except json.JSONDecodeError:
+        pass
+    try:
+        obj, _ = json.JSONDecoder().raw_decode(cleaned2)
+        return obj, None
+    except json.JSONDecodeError:
+        pass
+
+    return None, err1
+
+
+def _read_conf(slicer_type):
+    """Read BambuStudio.conf FULLY (no byte truncation) → (dict, path, error)."""
+    app = 'BambuStudio' if slicer_type != 'orca' else 'OrcaSlicer'
+    appdata = os.environ.get('APPDATA', '')
+    conf_path = os.path.join(appdata, app, f'{app}.conf')
+    if not os.path.isfile(conf_path):
+        return None, conf_path, 'file not found'
+    text = _try_read_file(conf_path)
+    if text is None:
+        return None, conf_path, 'cannot read'
+    data, err = _try_parse_json(text)
+    if data is None:
+        return None, conf_path, f'parse error: {err}'
+    return data, conf_path, None
+
+
+# ── INI parser ──
+
+def _parse_ini_settings(text):
+    """Parse INI-style config (key = value per line) to dict."""
+    settings = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith(';') or line.startswith('#'):
+            continue
+        idx = line.find('=')
+        if idx < 0:
+            continue
+        settings[line[:idx].strip()] = line[idx + 1:].strip()
+    return settings
+
+
+# ── Colour key extractor (works for both INI dicts and JSON dicts) ──
+
+def _filaments_from_colour_key(settings):
+    """Extract filament list from dict with filament_colour-like key."""
+    colours_raw = None
+    for ck in ('filament_colour', 'default_filament_colour',
+               'filament_color', 'default_filament_color'):
+        val = settings.get(ck)
+        if val:
+            colours_raw = val
+            break
+    if not colours_raw:
+        return None
+
+    # Handle list (JSON) or string (INI semicolons)
+    if isinstance(colours_raw, list):
+        colours = [str(c).strip() for c in colours_raw]
+    else:
+        colours = [c.strip() for c in str(colours_raw).split(';')]
+
+    names_raw = settings.get('filament_settings_id', '')
+    types_raw = settings.get('filament_type', '')
+    vendors_raw = settings.get('filament_vendor', '')
+    def _split(v):
+        if isinstance(v, list):
+            return [str(x).strip() for x in v]
+        return [x.strip() for x in str(v).split(';')] if v else []
+    names = _split(names_raw)
+    types = _split(types_raw)
+    vendors = _split(vendors_raw)
+
+    filaments = []
+    for i, raw in enumerate(colours):
+        colour = _normalize_hex(raw)
+        if not colour:
+            continue
+        name = names[i] if i < len(names) else ''
+        name = re.sub(r'\s*@\s*.+$', '', str(name)).strip()
+        ftype = types[i] if i < len(types) else 'PLA'
+        vendor = vendors[i] if i < len(vendors) else ''
+        filaments.append({'slot': i+1, 'name': name, 'color': colour,
+                          'type': ftype, 'vendor': vendor})
+    return filaments if filaments else None
+
+
+# ── .3mf multi-source extraction ──
+
+def _extract_all_from_3mf(filepath):
+    """Open .3mf ZIP and try ALL known data sources for filament info."""
+    debug = {'file': filepath, 'sources_tried': []}
+    try:
+        z = zipfile.ZipFile(filepath, 'r')
+    except (zipfile.BadZipFile, PermissionError, OSError) as e:
+        debug['open_error'] = str(e)
+        return None, None, debug
+    namelist = z.namelist()
+
+    for tryf in (_src_A_project_settings, _src_B_slice_info_xml,
+                 _src_C_config_filament_json, _src_D_3dmodel_xml):
+        result = tryf(z, namelist, debug)
+        if result:
+            z.close()
+            return result
+    z.close()
+    return None, None, debug
+
+
+def _src_A_project_settings(z, namelist, debug):
+    """Source A: Metadata/project_settings.config (can be JSON or INI)."""
+    src = {'name': 'A_project_settings'}
+    for cfg in namelist:
+        if 'project_settings' not in cfg.lower() or not cfg.lower().endswith('.config'):
+            continue
+        raw = z.read(cfg).decode('utf-8', errors='replace')
+        src['size'] = len(raw)
+        stripped = raw.lstrip()
+
+        if stripped.startswith('{'):
+            # JSON format (BambuStudio newer versions)
+            src['format'] = 'json'
+            data, err = _try_parse_json(raw)
+            if data and isinstance(data, dict):
+                filaments = _filaments_from_colour_key(data)
+                if filaments:
+                    src['status'] = 'ok_json'
+                    debug['sources_tried'].append(src)
+                    return filaments, f'project_settings_json:{cfg}', debug
+                ckeys = [k for k in data if 'colour' in k.lower() or 'color' in k.lower()]
+                src['colour_keys_found'] = ckeys[:10]
+                src['status'] = 'no_colour_key_json'
+            else:
+                src['status'] = 'json_parse_fail'
+                src['error'] = err
+        else:
+            # INI format
+            src['format'] = 'ini'
+            settings = _parse_ini_settings(raw)
+            filaments = _filaments_from_colour_key(settings)
+            if filaments:
+                src['status'] = 'ok_ini'
+                debug['sources_tried'].append(src)
+                return filaments, f'project_settings_ini:{cfg}', debug
+            src['status'] = 'no_colour_key_ini'
+        break
+    else:
+        src['status'] = 'file_not_found'
+    debug['sources_tried'].append(src)
+    return None
+
+
+def _src_B_slice_info_xml(z, namelist, debug):
+    """Source B: Metadata/slice_info.config — XML with <filament> tags.
+    Expected format:
+      <config>
+        <plate>
+          <filament id="1" type="PLA" color="#FF0000" used="1"/>
+          <filament id="2" type="PLA" color="#00FF00" used="0"/>
+        </plate>
+      </config>
+    """
+    src = {'name': 'B_slice_info_xml'}
+    for cfg in namelist:
+        if 'slice_info' not in cfg.lower() or not cfg.lower().endswith('.config'):
+            continue
+        raw = z.read(cfg).decode('utf-8', errors='replace')
+        src['size'] = len(raw)
+        if not raw.lstrip().startswith('<'):
+            src['status'] = 'not_xml'
+            break
+        try:
+            root = ET.fromstring(raw)
+        except ET.ParseError as e:
+            src['status'] = f'xml_error:{e}'
+            break
+
+        felems = root.findall('.//filament')
+        src['filament_tags'] = len(felems)
+        if not felems:
+            tags = sorted({elem.tag for elem in root.iter()})
+            src['available_tags'] = tags[:20]
+            src['status'] = 'no_filament_tags'
+            break
+
+        filaments = []
+        for elem in felems:
+            fid = elem.get('id', '')
+            color = _normalize_hex(elem.get('color', '') or elem.get('colour', ''))
+            ftype = elem.get('type', 'PLA')
+            used = elem.get('used', '1')
+            name = elem.get('sub_path', '') or elem.get('filament_settings_id', '')
+            name = re.sub(r'\s*@\s*.+$', '', name).strip()
+            if not name:
+                name = f'{ftype} #{fid}'
+            if color:
+                slot = int(fid) if fid.isdigit() else len(filaments) + 1
+                filaments.append({'slot': slot, 'name': name, 'color': color,
+                                  'type': ftype, 'vendor': '', 'used': used})
+        if filaments:
+            src['status'] = 'ok'
+            debug['sources_tried'].append(src)
+            return filaments, f'slice_info_xml:{cfg}', debug
+        # Has <filament> tags but no color attribute
+        src['status'] = 'tags_no_color'
+        if felems:
+            src['sample_attribs'] = dict(felems[0].attrib)
+        break
+    else:
+        src['status'] = 'file_not_found'
+    debug['sources_tried'].append(src)
+    return None
+
+
+def _src_C_config_filament_json(z, namelist, debug):
+    """Source C: Config/filament/*.json — embedded filament preset JSONs."""
+    src = {'name': 'C_config_filament_json'}
+    fjsons = [f for f in namelist
+              if f.lower().startswith('config/filament/') and f.lower().endswith('.json')]
+    if not fjsons:
+        fjsons = [f for f in namelist
+                  if 'filament' in f.lower() and f.lower().endswith('.json')]
+    src['files_found'] = len(fjsons)
+    if not fjsons:
+        src['status'] = 'no_json_files'
+        debug['sources_tried'].append(src)
+        return None
+
+    fjsons.sort()
+    filaments = []
+    src['parsed'] = []
+    for idx, fj in enumerate(fjsons[:16]):
+        try:
+            raw = z.read(fj).decode('utf-8', errors='replace')
+            data, err = _try_parse_json(raw)
+            if not data or not isinstance(data, dict):
+                src['parsed'].append({'file': os.path.basename(fj), 'error': err or 'not dict'})
+                continue
+            colour = ''
+            for ck in ('filament_colour', 'default_filament_colour',
+                        'filament_color', 'default_filament_color', 'color'):
+                val = data.get(ck)
+                if isinstance(val, list):
+                    val = val[0] if val else ''
+                colour = _normalize_hex(val)
+                if colour:
+                    break
+            name = data.get('name', '') or data.get('filament_settings_id', '')
+            if isinstance(name, list):
+                name = name[0] if name else ''
+            name = re.sub(r'\s*@\s*.+$', '', str(name)).strip() or os.path.splitext(os.path.basename(fj))[0]
+            ftype = data.get('filament_type', ['PLA'])
+            if isinstance(ftype, list):
+                ftype = ftype[0] if ftype else 'PLA'
+            vendor = data.get('filament_vendor', [''])
+            if isinstance(vendor, list):
+                vendor = vendor[0] if vendor else ''
+            src['parsed'].append({'file': os.path.basename(fj), 'color': colour, 'name': name})
+            if colour:
+                filaments.append({'slot': idx+1, 'name': name, 'color': colour,
+                                  'type': ftype, 'vendor': vendor})
+        except Exception as e:
+            src['parsed'].append({'file': os.path.basename(fj), 'error': str(e)})
+
+    if filaments:
+        src['status'] = 'ok'
+        debug['sources_tried'].append(src)
+        return filaments, f'config_json:{len(filaments)} files', debug
+    src['status'] = 'no_colors_in_json'
+    debug['sources_tried'].append(src)
+    return None
+
+
+def _src_D_3dmodel_xml(z, namelist, debug):
+    """Source D: 3D/3dmodel.model — standard 3MF <basematerials>."""
+    src = {'name': 'D_3dmodel_xml'}
+    mfiles = [f for f in namelist if f.lower() == '3d/3dmodel.model']
+    if not mfiles:
+        src['status'] = 'file_not_found'
+        debug['sources_tried'].append(src)
+        return None
+    try:
+        raw = z.read(mfiles[0]).decode('utf-8', errors='replace')
+        raw_ns = re.sub(r'\sxmlns="[^"]*"', '', raw, count=5)
+        root = ET.fromstring(raw_ns)
+    except (ET.ParseError, Exception) as e:
+        src['status'] = f'parse_error:{e}'
+        debug['sources_tried'].append(src)
+        return None
+    bases = root.findall('.//basematerials')
+    if not bases:
+        src['status'] = 'no_basematerials'
+        debug['sources_tried'].append(src)
+        return None
+    filaments = []
+    for bm in bases:
+        for i, base in enumerate(bm):
+            color = _normalize_hex(base.get('displaycolor', ''))
+            name = base.get('name', f'Material {i+1}')
+            if color:
+                filaments.append({'slot': i+1, 'name': name, 'color': color,
+                                  'type': 'PLA', 'vendor': ''})
+    if filaments:
+        src['status'] = 'ok'
+        debug['sources_tried'].append(src)
+        return filaments, f'3dmodel_basematerials', debug
+    src['status'] = 'no_colors'
+    debug['sources_tried'].append(src)
+    return None
+
+
+# ── .3mf file collection ──
+
+def _collect_3mf_files(slicer_type, conf_data=None):
+    """Gather .3mf files, newest first, deduped."""
+    found = []
+    seen = set()
+    appdata = os.environ.get('APPDATA', '')
+    userprofile = os.environ.get('USERPROFILE', '')
+    app = 'BambuStudio' if slicer_type != 'orca' else 'OrcaSlicer'
+
+    def add(path):
+        if not path or not isinstance(path, str):
+            return
+        path = path.replace('/', os.sep)
+        if not path.lower().endswith('.3mf'):
+            return
+        np = os.path.normcase(os.path.abspath(path))
+        if np in seen:
+            return
+        seen.add(np)
+        if os.path.isfile(path):
+            try:
+                found.append((os.path.getmtime(path), path))
+            except OSError:
+                pass
+
+    if conf_data:
+        rp = conf_data.get('recent_projects', [])
+        if isinstance(rp, list):
+            for item in rp:
+                if isinstance(item, str):
+                    add(item)
+                elif isinstance(item, dict):
+                    add(item.get('path', ''))
+        elif isinstance(rp, dict):
+            # BambuStudio format: {"001": "path", "002": "path", ...}
+            for key in sorted(rp.keys()):
+                val = rp[key]
+                if isinstance(val, str):
+                    add(val)
+    for sub in ('', 'cache', 'projects'):
+        d = os.path.join(appdata, app, sub) if sub else os.path.join(appdata, app)
+        if os.path.isdir(d):
+            try:
+                for e in os.scandir(d):
+                    if e.is_file(): add(e.path)
+            except (PermissionError, OSError):
+                pass
+    for name in ('Desktop', 'Documents', 'Downloads', '3D Objects'):
+        d = os.path.join(userprofile, name)
+        if os.path.isdir(d):
+            try:
+                for e in os.scandir(d):
+                    if e.is_file(): add(e.path)
+            except (PermissionError, OSError):
+                pass
+    found.sort(reverse=True)
+    return found
+
+
+# ── Main entry points ──
+
+def _build_filament_color_map(user_dir, app, appdata):
+    """Build {preset_name: '#RRGGBB'} map from user + system filament presets."""
+    color_map = {}
+
+    # 1) User presets: %APPDATA%\BambuStudio\user\[UID]\filament\*.json
+    if os.path.isdir(user_dir):
+        for uid in os.listdir(user_dir):
+            fil_dir = os.path.join(user_dir, uid, 'filament')
+            if os.path.isdir(fil_dir):
+                _scan_filament_dir(fil_dir, color_map)
+
+    # 2) System presets: %APPDATA%\BambuStudio\system\*\filament\
+    sys_dir = os.path.join(appdata, app, 'system')
+    if os.path.isdir(sys_dir):
+        for vendor in os.listdir(sys_dir):
+            fil_dir = os.path.join(sys_dir, vendor, 'filament')
+            if os.path.isdir(fil_dir):
+                _scan_filament_dir(fil_dir, color_map)
+
+    # 3) Program files resources
+    for pf in [os.environ.get('ProgramFiles', ''), os.environ.get('ProgramFiles(x86)', '')]:
+        if not pf:
+            continue
+        prog_dir = os.path.join(pf, 'Bambu Studio', 'resources', 'profiles')
+        if os.path.isdir(prog_dir):
+            for vendor in os.listdir(prog_dir):
+                fil_dir = os.path.join(prog_dir, vendor, 'filament')
+                if os.path.isdir(fil_dir):
+                    _scan_filament_dir(fil_dir, color_map)
+
+    return color_map
+
+
+def _scan_filament_dir(fil_dir, color_map):
+    """Scan a directory of .json filament presets and add to color_map."""
+    try:
+        for entry in os.scandir(fil_dir):
+            if not entry.is_file():
+                # Could be subdirectory with more JSONs
+                if entry.is_dir():
+                    try:
+                        for sub_entry in os.scandir(entry.path):
+                            if sub_entry.is_file() and sub_entry.name.lower().endswith('.json'):
+                                _read_filament_preset(sub_entry.path, color_map)
+                    except (PermissionError, OSError):
+                        pass
+                continue
+            if entry.name.lower().endswith('.json'):
+                _read_filament_preset(entry.path, color_map)
+            elif entry.name.lower().endswith('.info'):
+                # BambuStudio .info format (INI-style)
+                _read_filament_info(entry.path, color_map)
+    except (PermissionError, OSError):
+        pass
+
+
+def _read_filament_preset(filepath, color_map):
+    """Read a single filament .json preset and add name→color to map."""
+    try:
+        text = _try_read_file(filepath)
+        if not text:
+            return
+        data, _ = _try_parse_json(text)
+        if not data or not isinstance(data, dict):
+            return
+        # Get name
+        name = ''
+        for nk in ('name', 'filament_settings_id'):
+            val = data.get(nk)
+            if isinstance(val, list):
+                val = val[0] if val else ''
+            if val:
+                name = str(val).strip()
+                break
+        if not name:
+            name = os.path.splitext(os.path.basename(filepath))[0]
+        # Get color
+        for ck in ('filament_colour', 'default_filament_colour', 'filament_color', 'color'):
+            val = data.get(ck)
+            if isinstance(val, list):
+                val = val[0] if val else ''
+            colour = _normalize_hex(val)
+            if colour:
+                color_map[name] = colour
+                # Also map without @printer suffix
+                base = re.sub(r'\s*@\s*.+$', '', name).strip()
+                if base and base != name:
+                    color_map[base] = colour
+                # Also lowercase
+                color_map[name.lower()] = colour
+                color_map[base.lower()] = colour
+                break
+    except Exception:
+        pass
+
+
+def _read_filament_info(filepath, color_map):
+    """Read .info file (INI format) for filament name→color."""
+    try:
+        text = _try_read_file(filepath)
+        if not text:
+            return
+        settings = _parse_ini_settings(text)
+        name = settings.get('name', '') or os.path.splitext(os.path.basename(filepath))[0]
+        for ck in ('filament_colour', 'default_filament_colour', 'filament_color'):
+            colour = _normalize_hex(settings.get(ck, ''))
+            if colour:
+                color_map[name] = colour
+                color_map[name.lower()] = colour
+                break
+    except Exception:
+        pass
+
+
+def get_project_filaments(slicer_type='bambu'):
+    """Main: find and extract project filaments."""
+    debug = {'strategies': []}
+    app = 'BambuStudio' if slicer_type != 'orca' else 'OrcaSlicer'
+    appdata = os.environ.get('APPDATA', '')
+
+    conf_data, conf_path, conf_err = _read_conf(slicer_type)
+    debug['conf'] = {'path': conf_path, 'ok': conf_data is not None, 'error': conf_err}
+
+    # ── Strategy 0: conf JSON → filament colors ──
+    # BambuStudio: presets.filament_colors = "#DCD,#FFF,..." (comma-separated string)
+    # OrcaSlicer:  orca_presets = [{machine:"X", filament_colors:"#A,#B"}, ...] (array per printer)
+    s0 = {'name': '0_conf_json_presets'}
+    if conf_data and isinstance(conf_data, dict):
+        found_colors = ''
+        found_names = []
+        found_in = ''
+
+        # ── Path A: BambuStudio-style presets.filament_colors (string) ──
+        presets = conf_data.get('presets', {})
+        if isinstance(presets, dict):
+            s0['presets_keys'] = list(presets.keys())[:20]
+            for ck in ('filament_colors', 'filament_colours', 'filament_multi_colors'):
+                val = presets.get(ck, '')
+                if val and isinstance(val, str) and '#' in val:
+                    found_colors = val
+                    found_in = f'presets.{ck}'
+                    break
+            if found_colors:
+                fil = presets.get('filaments', [])
+                if isinstance(fil, list) and fil and fil[0] is not None:
+                    found_names = fil
+
+        # ── Path B: OrcaSlicer-style orca_presets array ──
+        if not found_colors:
+            orca_presets = conf_data.get('orca_presets', [])
+            if isinstance(orca_presets, list) and orca_presets:
+                s0['orca_presets_count'] = len(orca_presets)
+                # Get currently selected machine
+                current_machine = ''
+                if isinstance(presets, dict):
+                    current_machine = presets.get('machine', '')
+                s0['current_machine'] = current_machine
+
+                # Find matching entry (try exact match, then partial)
+                matched_entry = None
+                for entry in orca_presets:
+                    if not isinstance(entry, dict):
+                        continue
+                    em = entry.get('machine', '')
+                    if em == current_machine:
+                        matched_entry = entry
+                        break
+                # Partial match (machine name without suffix)
+                if not matched_entry and current_machine:
+                    cm_base = current_machine.split('_')[0].strip()
+                    for entry in orca_presets:
+                        if not isinstance(entry, dict):
+                            continue
+                        em = entry.get('machine', '')
+                        if cm_base and cm_base in em:
+                            matched_entry = entry
+                            break
+                # Last resort: use the last entry (most recently used printer)
+                if not matched_entry:
+                    matched_entry = orca_presets[-1] if orca_presets else None
+
+                if matched_entry:
+                    s0['matched_machine'] = matched_entry.get('machine', '(none)')
+                    fc = matched_entry.get('filament_colors', '')
+                    if fc and '#' in fc:
+                        found_colors = fc
+                        found_in = 'orca_presets.filament_colors'
+                        # Extract names from filament, filament_01, filament_02, ...
+                        names = []
+                        base = matched_entry.get('filament', '')
+                        if base:
+                            names.append(base)
+                        for idx in range(1, 32):
+                            key = f'filament_{idx:02d}'
+                            val = matched_entry.get(key, '')
+                            if val:
+                                names.append(val)
+                            else:
+                                break
+                        if names:
+                            found_names = names
+
+        s0['found_colors'] = str(found_colors)[:200] if found_colors else '(none)'
+        s0['found_names'] = len(found_names)
+        s0['found_in'] = found_in or '(none)'
+
+        if found_colors:
+            sep = ',' if ',' in found_colors else ';'
+            colours = [c.strip() for c in found_colors.split(sep)]
+            filaments = []
+            for i in range(max(len(colours), len(found_names))):
+                colour = _normalize_hex(colours[i]) if i < len(colours) else ''
+                name = ''
+                if i < len(found_names) and found_names[i] is not None:
+                    name = str(found_names[i])
+                base_name = re.sub(r'\s*@\s*.+$', '', name).strip()
+                ftype = 'PLA'
+                for t in ('PETG', 'ABS', 'TPU', 'ASA', 'PA', 'PC', 'PVA'):
+                    if t.lower() in name.lower():
+                        ftype = t
+                        break
+                filaments.append({
+                    'slot': i+1, 'name': base_name, 'color': colour or '#808080',
+                    'type': ftype, 'vendor': ''
+                })
+            if filaments:
+                has_colors = sum(1 for f in filaments if f['color'] != '#808080')
+                s0['status'] = f'ok:{has_colors}_colors/{len(filaments)}_slots'
+                debug['strategies'].append(s0)
+                return {'status':'ok','count':len(filaments),'filaments':filaments,
+                        'source':f'conf:{found_in}','debug':debug}
+        s0['status'] = 'no_colors_found'
+    else:
+        s0['status'] = 'conf_unavailable'
+    debug['strategies'].append(s0)
+
+    # ── Strategy 1: conf → last_backup_path → Metadata/ ──
+    s1 = {'name': '1_backup_path'}
+    if conf_data:
+        backup_path = ''
+        app_sec = conf_data.get('app', {})
+        if isinstance(app_sec, dict):
+            backup_path = app_sec.get('last_backup_path', '')
+        if not backup_path:
+            backup_path = conf_data.get('last_backup_path', '')
+        if backup_path:
+            backup_path = backup_path.replace('/', os.sep)
+            s1['path'] = backup_path
+            meta_dir = os.path.join(backup_path, 'Metadata')
+            if os.path.isdir(meta_dir):
+                for cfg_name in ('project_settings.config', 'slice_info.config'):
+                    cfg_file = os.path.join(meta_dir, cfg_name)
+                    if not os.path.isfile(cfg_file):
+                        continue
+                    text = _try_read_file(cfg_file)
+                    if not text:
+                        continue
+                    filaments = _try_parse_any_format(text)
+                    if filaments:
+                        s1['status'] = f'ok:{cfg_name}'
+                        debug['strategies'].append(s1)
+                        return {'status':'ok','count':len(filaments),'filaments':filaments,
+                                'source':f'backup:{cfg_name}','debug':debug}
+                s1['status'] = 'no_colour_in_backup'
+                try: s1['metadata_files'] = os.listdir(meta_dir)[:15]
+                except: pass
+            else:
+                s1['status'] = 'metadata_dir_missing'
+        else:
+            s1['status'] = 'no_backup_path'
+    else:
+        s1['status'] = 'conf_unavailable'
+    debug['strategies'].append(s1)
+
+    # ── Strategy 2: %TEMP% model dir scan ──
+    s2 = {'name': '2_temp_scan'}
+    temp = tempfile.gettempdir()
+    temp_dirs = ['bamboo_model']
+    if slicer_type == 'orca':
+        temp_dirs = ['orcaslicer_model', 'orca_model', 'bamboo_model']
+    for td in temp_dirs:
+        model_root = os.path.join(temp, td)
+        s2['root'] = model_root
+        if not os.path.isdir(model_root):
+            continue
+        configs = []
+        for rd, dirs, files in os.walk(model_root):
+            for fn in files:
+                if fn.lower().endswith('.config'):
+                    fp = os.path.join(rd, fn)
+                    try: configs.append((os.path.getmtime(fp), fp))
+                    except OSError: pass
+        configs.sort(reverse=True)
+        s2['configs_found'] = len(configs)
+        for _, fp in configs[:10]:
+            text = _try_read_file(fp)
+            if text:
+                filaments = _try_parse_any_format(text)
+                if filaments:
+                    s2['status'] = f'ok:{fp}'
+                    debug['strategies'].append(s2)
+                    return {'status':'ok','count':len(filaments),'filaments':filaments,
+                            'source':f'temp:{fp}','debug':debug}
+    s2['status'] = 'no_colour_in_temp'
+    debug['strategies'].append(s2)
+
+    # ── Strategy 3: .3mf files (multi-source extraction) ──
+    s3 = {'name': '3_3mf_files'}
+    all_3mf = _collect_3mf_files(slicer_type, conf_data)
+    s3['total'] = len(all_3mf)
+    s3['files'] = [os.path.basename(p) for _, p in all_3mf[:8]]
+    s3['checked'] = []
+    for _, path in all_3mf[:20]:
+        filaments, source, exdebug = _extract_all_from_3mf(path)
+        check = {'file': os.path.basename(path),
+                 'sources': [s.get('name','?')+':'+s.get('status','?')
+                             for s in exdebug.get('sources_tried', [])]}
+        if filaments:
+            check['count'] = len(filaments)
+            s3['checked'].append(check)
+            s3['matched'] = path
+            debug['strategies'].append(s3)
+            return {'status':'ok','count':len(filaments),'filaments':filaments,
+                    'source':f'3mf:{path}|{source}','debug':debug}
+        s3['checked'].append(check)
+    s3['status'] = 'none_matched'
+    debug['strategies'].append(s3)
+    return {'status':'empty','count':0,'filaments':[],'debug':debug}
+
+
+def _try_parse_any_format(text):
+    """Try JSON, XML, INI to extract filaments from a config text."""
+    stripped = text.lstrip()
+    if stripped.startswith('{'):
+        data, _ = _try_parse_json(text)
+        if data and isinstance(data, dict):
+            return _filaments_from_colour_key(data)
+    elif stripped.startswith('<'):
+        try:
+            root = ET.fromstring(text)
+            felems = root.findall('.//filament')
+            filaments = []
+            for elem in felems:
+                color = _normalize_hex(elem.get('color', ''))
+                if color:
+                    fid = elem.get('id', '')
+                    slot = int(fid) if fid.isdigit() else len(filaments)+1
+                    ftype = elem.get('type', 'PLA')
+                    filaments.append({'slot':slot,'name':f'{ftype} #{fid}',
+                        'color':color,'type':ftype,'vendor':''})
+            if filaments:
+                return filaments
+        except ET.ParseError:
+            pass
+    else:
+        return _filaments_from_colour_key(_parse_ini_settings(text))
+    return None
+
+
+def debug_slicer_conf(slicer_type='bambu'):
+    """Diagnostic: dump conf contents including INI [presets] tail."""
+    result = {}
+    app = 'BambuStudio' if slicer_type != 'orca' else 'OrcaSlicer'
+    appdata = os.environ.get('APPDATA', '')
+
+    conf_path = os.path.join(appdata, app, f'{app}.conf')
+    result['conf_path'] = conf_path
+    result['conf_exists'] = os.path.isfile(conf_path)
+    if os.path.isfile(conf_path):
+        raw = _try_read_file(conf_path)
+        if raw:
+            result['conf_size'] = len(raw)
+            result['conf_first_500'] = raw[:500]
+            # CRITICAL: show the TAIL (where [presets] section lives!)
+            result['conf_last_2000'] = raw[-2000:]
+
+            # Try JSON parse (gets the first JSON object)
+            data, err = _try_parse_json(raw)
+            if data:
+                result['conf_json_parsed'] = True
+                result['conf_json_keys'] = sorted(data.keys())
+                # Dump ALL potentially relevant sections
+                for k in ('presets', 'orca_presets', 'filaments', 'filament',
+                          'filament_colour', 'filament_color', 'custom_color_list'):
+                    if k in data:
+                        val = data[k]
+                        if isinstance(val, (dict, list)):
+                            dumped = json.dumps(val, ensure_ascii=False)
+                            result[f'conf_json_{k}'] = json.loads(dumped) if len(dumped) < 2000 else dumped[:2000]
+                        else:
+                            result[f'conf_json_{k}'] = val
+                app_sec = data.get('app', {})
+                if isinstance(app_sec, dict):
+                    result['conf_last_backup'] = app_sec.get('last_backup_path', '(none)')
+            else:
+                result['conf_json_parsed'] = False
+                result['conf_json_error'] = err
+
+            # Parse INI sections (after JSON or standalone)
+            ini_sections = _parse_conf_ini_sections(raw)
+            result['conf_ini_sections'] = list(ini_sections.keys())
+            if 'presets' in ini_sections:
+                result['conf_presets'] = ini_sections['presets']
+            # Show ALL filament-related keys from any INI section
+            for sec_name, sec_data in ini_sections.items():
+                for k, v in sec_data.items():
+                    if 'filament' in k.lower() or 'colour' in k.lower() or 'color' in k.lower():
+                        result[f'ini_{sec_name}_{k}'] = v[:500] if len(v) > 500 else v
+
+    # User filament preset directory
+    user_dir = os.path.join(appdata, app, 'user')
+    result['user_dir'] = user_dir
+    result['user_dir_exists'] = os.path.isdir(user_dir)
+    if os.path.isdir(user_dir):
+        # List user IDs
+        try:
+            user_ids = os.listdir(user_dir)
+            result['user_ids'] = user_ids[:5]
+            for uid in user_ids[:2]:
+                fil_dir = os.path.join(user_dir, uid, 'filament')
+                if os.path.isdir(fil_dir):
+                    try:
+                        fils = os.listdir(fil_dir)
+                        result[f'user_{uid}_filaments'] = fils[:20]
+                        # Read first filament preset to show structure
+                        if fils:
+                            sample = os.path.join(fil_dir, fils[0])
+                            if os.path.isfile(sample):
+                                txt = _try_read_file(sample)
+                                if txt:
+                                    result[f'user_filament_sample_name'] = fils[0]
+                                    result[f'user_filament_sample_first500'] = txt[:500]
+                    except (PermissionError, OSError):
+                        pass
+        except (PermissionError, OSError):
+            pass
+
+    # System filament presets
+    sys_fil_dir = os.path.join(appdata, app, 'system', 'Bambu', 'filament')
+    if not os.path.isdir(sys_fil_dir):
+        # Try program files
+        for pf in [os.environ.get('ProgramFiles', ''), os.environ.get('ProgramFiles(x86)', '')]:
+            prog_name = 'Bambu Studio' if slicer_type != 'orca' else 'OrcaSlicer'
+            d = os.path.join(pf, prog_name, 'resources', 'profiles', 'Bambu', 'filament')
+            if os.path.isdir(d):
+                sys_fil_dir = d
+                break
+    result['system_filament_dir'] = sys_fil_dir
+    result['system_filament_exists'] = os.path.isdir(sys_fil_dir)
+
+    # Temp dir (check bamboo_model, orcaslicer_model, orca_model)
+    temp = tempfile.gettempdir()
+    temp_dirs = ['bamboo_model']
+    if slicer_type == 'orca':
+        temp_dirs = ['orcaslicer_model', 'orca_model', 'bamboo_model']
+    for td in temp_dirs:
+        model_root = os.path.join(temp, td)
+        result[f'temp_dir_{td}'] = model_root
+        result[f'temp_exists_{td}'] = os.path.isdir(model_root)
+        if os.path.isdir(model_root):
+            all_files = []
+            for rd, ds, fs in os.walk(model_root):
+                for fn in fs:
+                    fp = os.path.join(rd, fn)
+                    rel = os.path.relpath(fp, model_root)
+                    try:
+                        all_files.append(f'{rel} ({os.path.getsize(fp)}B)')
+                    except OSError:
+                        all_files.append(rel)
+            result[f'temp_files_{td}'] = all_files[:30]
+
+    return result
+
+
+def _parse_conf_ini_sections(text):
+    """Extract INI [sections] from BambuStudio.conf (may follow JSON block).
+    Returns dict of {section_name: {key: value, ...}}.
+    """
+    sections = {}
+    current_section = None
+
+    # Find where INI starts — look for [section] headers
+    for line in text.splitlines():
+        stripped = line.strip()
+        # Skip JSON content
+        if stripped.startswith('{') or stripped.startswith('}'):
+            continue
+        # Section header
+        m = re.match(r'^\[([^\]]+)\]$', stripped)
+        if m:
+            current_section = m.group(1).lower()
+            sections[current_section] = {}
+            continue
+        # Key = value in a section
+        if current_section and '=' in stripped:
+            idx = stripped.index('=')
+            key = stripped[:idx].strip()
+            val = stripped[idx+1:].strip()
+            sections[current_section][key] = val
+
+    return sections
 
 # Embedded SVG data for icon generation
 KEYCAP_SVG = '''<?xml version="1.0" encoding="UTF-8"?>
@@ -626,8 +1587,33 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 "slicers": {
                     "bambu": {"available": bambu is not None, "path": bambu or ""},
                     "orca": {"available": orca is not None, "path": orca or ""},
-                }
+                },
+                "features": ["project-filaments"]
             })
+        elif self.path.startswith('/project-filaments'):
+            slicer = 'bambu'
+            if '?' in self.path:
+                from urllib.parse import parse_qs, urlparse
+                qs = parse_qs(urlparse(self.path).query)
+                slicer = qs.get('slicer', ['bambu'])[0]
+            try:
+                result = get_project_filaments(slicer)
+                self._send_json(200, result)
+            except Exception as e:
+                import traceback
+                self._send_json(500, {"error": str(e), "tb": traceback.format_exc()})
+        elif self.path.startswith('/debug'):
+            slicer = 'bambu'
+            if '?' in self.path:
+                from urllib.parse import parse_qs, urlparse
+                qs = parse_qs(urlparse(self.path).query)
+                slicer = qs.get('slicer', ['bambu'])[0]
+            try:
+                result = debug_slicer_conf(slicer)
+                self._send_json(200, result)
+            except Exception as e:
+                import traceback
+                self._send_json(500, {"error": str(e), "tb": traceback.format_exc()})
         else:
             self._send_json(404, {"error": "Not found"})
 

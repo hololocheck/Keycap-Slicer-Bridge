@@ -67,7 +67,7 @@ Keycap Slicer Bridge は、[Keycap Generator](https://github.com/hololocheck/Key
 
 Python のインストールは不要です。
 
-1. [Releases](../../releases) から最新の `.exe` をダウンロード
+1. [Releases](../../releases) から最新の `.zip` をダウンロード`dist`フォルダに`.exe`があります
 2. ダブルクリックで起動
 
 > **Note:** Windows Defender 等が初回起動時に警告を出す場合があります。「詳細情報」→「実行」で起動してください。
